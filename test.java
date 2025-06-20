@@ -477,3 +477,179 @@ public class LOVHandler {
     }
 }
 
+
+import org.openqa.selenium.By;
+import org.openqa.selenium.WebDriver;
+import org.openqa.selenium.WebElement;
+import org.openqa.selenium.chrome.ChromeDriver;
+import org.openqa.selenium.chrome.ChromeOptions;
+import org.openqa.selenium.devtools.DevTools;
+import org.openqa.selenium.devtools.v126.network.Network; // Check your exact version (e.g., v126, v127, etc.)
+import org.openqa.selenium.devtools.v126.network.model.RequestId;
+import org.openqa.selenium.devtools.v126.network.model.RequestWillBeSent;
+import org.openqa.selenium.devtools.v126.network.model.ResponseReceived;
+import org.openqa.selenium.devtools.v126.network.model.LoadingFinished;
+import org.openqa.selenium.support.ui.ExpectedConditions;
+import org.openqa.selenium.support.ui.WebDriverWait;
+
+import java.time.Duration;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.Optional; // For DevTools API
+
+public class LOVPopupPage {
+    private WebDriver driver;
+    private WebDriverWait wait;
+    private DevTools devTools;
+
+    // Use ConcurrentHashSet if multiple threads interact, otherwise HashSet is fine for single-threaded Selenium
+    private Set<RequestId> pendingXhrRequests = new HashSet<>();
+    private final String ADF_XHR_URL_PART = "/faces/oracle/"; // You might need to adjust this based on your XHR URLs
+
+    // Primary Locator for the LOV popup container
+    private By lovPopupContainerLocator = By.cssSelector("div[id*='popup-container']");
+
+    // Locators for elements *within* the LOV popup
+    private By popupSearchInputLocator = By.xpath(".//label[text()='Name']//following::input[1]");
+    private By popupSearchButtonLocator = By.xpath(".//button[text()='Search']");
+    private By searchResultsTableLocator = By.xpath(".//table[contains(@class,'AFDataTable')]");
+    private By popupOKButtonLocator = By.xpath(".//button[text()='OK']");
+
+
+    public LOVPopupPage(WebDriver driver) {
+        this.driver = driver;
+        this.wait = new WebDriverWait(driver, Duration.ofSeconds(45));
+
+        // Important: Only proceed with DevTools if the driver is a ChromeDriver (or EdgeDriver)
+        if (driver instanceof ChromeDriver) {
+            this.devTools = ((ChromeDriver) driver).getDevTools();
+            this.devTools.createSession();
+            this.devTools.send(Network.enable(Optional.empty(), Optional.empty(), Optional.empty()));
+
+            // Listen for network events
+            this.devTools.addListener(Network.requestWillBeSent(), request -> {
+                if (request.getRequest().getUrl().contains(ADF_XHR_URL_PART) && request.getType().toString().equalsIgnoreCase("XHR")) {
+                    pendingXhrRequests.add(request.getRequestId());
+                    // System.out.println("XHR Request started: " + request.getRequest().getUrl());
+                }
+            });
+
+            this.devTools.addListener(Network.responseReceived(), response -> {
+                if (response.getType().toString().equalsIgnoreCase("XHR") && pendingXhrRequests.contains(response.getRequestId())) {
+                    // XHR request completed its response. We can remove it here or wait for LoadingFinished
+                    // For more robust "loading finished", it's better to wait for LoadingFinished event.
+                    // pendingXhrRequests.remove(response.getRequestId()); // Might remove too early
+                }
+            });
+
+            this.devTools.addListener(Network.loadingFinished(), loadingFinished -> {
+                // Ensure it's an XHR request we were tracking
+                if (pendingXhrRequests.contains(loadingFinished.getRequestId())) {
+                    pendingXhrRequests.remove(loadingFinished.getRequestId());
+                    // System.out.println("XHR Request finished: " + loadingFinished.getRequestId());
+                }
+            });
+
+        } else {
+            System.out.println("Warning: DevTools API for XHR monitoring is only supported for Chrome/Edge drivers. Using fallback waits.");
+            this.devTools = null; // No DevTools for this driver type
+        }
+    }
+
+    /**
+     * Waits for all relevant XHR requests to complete.
+     */
+    private void waitForAdfAjaxToComplete() {
+        if (devTools == null) {
+            System.out.println("DevTools not initialized, skipping XHR wait. Relying on explicit element waits.");
+            // Fallback: If DevTools isn't available, fall back to waiting for page ready state
+            // and possibly other UI changes, or just rely on the subsequent element waits.
+            // You might add a Thread.sleep(500) here as a last resort if flakiness persists without visible indicators.
+            try {
+                wait.until(webDriver -> ((JavascriptExecutor) webDriver).executeScript("return document.readyState").equals("complete"));
+            } catch (Exception e) {
+                System.out.println("Document ready state wait timed out: " + e.getMessage());
+            }
+            return;
+        }
+
+        try {
+            // Wait for pendingXhrRequests set to become empty
+            wait.until(d -> {
+                // System.out.println("Pending XHR Requests: " + pendingXhrRequests.size());
+                return pendingXhrRequests.isEmpty();
+            });
+            System.out.println("All relevant XHR requests completed.");
+
+            // Add a small, immediate wait for the browser to process the DOM updates after AJAX completion
+            // This is crucial even after XHRs are done, as browser rendering takes a moment.
+            Thread.sleep(200); // 200ms is often enough
+
+        } catch (Exception e) {
+            System.err.println("XHR AJAX completion wait timed out or failed: " + e.getMessage());
+            // It's possible for the XHRs to complete too fast, or for a non-tracked XHR to cause a delay.
+            // If the next step (waiting for the element) passes, this timeout might be acceptable.
+        }
+    }
+
+    /**
+     * Searches for a value within the LOV popup and selects it.
+     * @param value The value to search for and select.
+     */
+    public void searchAndSelectValue(String value) {
+        // Step 1: Wait for the LOV popup to be visible using the primary container locator
+        WebElement lovPopupContainer = wait.until(ExpectedConditions.visibilityOfElementLocated(lovPopupContainerLocator));
+        System.out.println("LOV popup is visible using locator: " + lovPopupContainerLocator);
+
+        // Crucial: Wait for any initial AJAX calls after popup appears
+        // The popup itself might trigger an XHR to load its initial content
+        waitForAdfAjaxToComplete();
+
+        // Step 2: Enter search criteria in the popup's search field
+        WebElement popupSearchInput = wait.until(ExpectedConditions.elementToBeClickable(lovPopupContainer.findElement(popupSearchInputLocator)));
+        popupSearchInput.clear();
+        popupSearchInput.sendKeys(value);
+        System.out.println("Entered '" + value + "' into LOV popup search field.");
+
+        // Step 3: Click the search button within the popup
+        WebElement popupSearchButton = wait.until(ExpectedConditions.elementToBeClickable(lovPopupContainer.findElement(popupSearchButtonLocator)));
+        popupSearchButton.click();
+        System.out.println("Clicked LOV popup Search button.");
+
+        // Step 4: Wait for search results to load.
+        // This is a crucial AJAX wait after clicking search.
+        waitForAdfAjaxToComplete(); // Call our helper method
+
+        // Now, wait for the actual results to appear (most reliable *after* AJAX completion)
+        By resultRowLocator = By.xpath(".//table[contains(@class,'AFDataTable')]//td[text()='" + value + "']");
+        WebElement desiredValueElement = wait.until(ExpectedConditions.elementToBeClickable(lovPopupContainer.findElement(resultRowLocator)));
+        System.out.println("LOV search results loaded and element visible.");
+
+        // Step 5: Select the desired value from the results table
+        desiredValueElement.click();
+        System.out.println("Clicked on desired value '" + value + "' in LOV popup results.");
+
+        // Step 6: Click the OK/Select button within the popup if it exists and is needed
+        if (driver.findElements(popupOKButtonLocator).size() > 0) {
+            WebElement popupOKButton = wait.until(ExpectedConditions.elementToBeClickable(lovPopupContainer.findElement(popupOKButtonLocator)));
+            popupOKButton.click();
+            System.out.println("Clicked LOV popup OK button.");
+        } else {
+             System.out.println("No 'OK' button found; assuming LOV auto-closes on selection.");
+        }
+
+        // Step 7: Wait for the popup to close.
+        wait.until(ExpectedConditions.invisibilityOfElementLocated(lovPopupContainerLocator));
+        System.out.println("LOV popup closed.");
+
+        // Optionally, wait for a final AJAX call on the main page after the popup closes.
+        waitForAdfAjaxToComplete();
+    }
+
+    // You'll need to call this to gracefully shut down the DevTools session
+    public void closeDevTools() {
+        if (devTools != null) {
+            devTools.close();
+        }
+    }
+}
