@@ -1,6 +1,4 @@
 import org.openqa.selenium.*;
-import org.openqa.selenium.chrome.ChromeDriver;
-import org.openqa.selenium.support.ui.ExpectedCondition;
 import org.openqa.selenium.support.ui.ExpectedConditions;
 import org.openqa.selenium.support.ui.WebDriverWait;
 
@@ -10,156 +8,149 @@ public class OracleFSCMHelper {
 
     private final WebDriver driver;
     private final WebDriverWait wait;
-    private final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(45);
-    private final int RETRY_ATTEMPTS = 3;
-    private final int RETRY_DELAY_MS = 1500;
+    private final int maxRetries = 3;
 
     public OracleFSCMHelper(WebDriver driver) {
         this.driver = driver;
-        this.wait = new WebDriverWait(driver, DEFAULT_TIMEOUT);
+        this.wait = new WebDriverWait(driver, Duration.ofSeconds(45));
     }
 
-    /**
-     * Clicks an element with retries and waits for loading.
-     */
-    public void clickElementAndHandleLoading(By locator) {
-        boolean success = false;
-        int attempts = 0;
-        while (!success && attempts < RETRY_ATTEMPTS) {
-            try {
-                WebElement element = wait.until(ExpectedConditions.elementToBeClickable(locator));
-                scrollIntoView(element);
-                element.click();
-                waitForLoadingToFinish();
-                success = true;
-            } catch (StaleElementReferenceException | ElementClickInterceptedException | TimeoutException e) {
-                attempts++;
-                sleep(RETRY_DELAY_MS);
-                if (attempts == RETRY_ATTEMPTS) {
-                    throw new RuntimeException("Failed to click element after retries: " + locator, e);
-                }
-            }
-        }
+    // -------------------------------
+    // Action Methods
+    // -------------------------------
+
+    public void clickElementAndWait(By locator) {
+        retryClick(locator);
+        waitForPageToLoad();
     }
 
-    /**
-     * Enters text into an input field with retries and waits for refresh.
-     */
-    public void enterTextAndHandleRefresh(By locator, String text) {
-        int attempts = 0;
-        boolean success = false;
-
-        while (!success && attempts < RETRY_ATTEMPTS) {
-            try {
-                WebElement input = wait.until(ExpectedConditions.visibilityOfElementLocated(locator));
-                scrollIntoView(input);
-                input.click();
-                input.clear();
-                input.sendKeys(text);
-
-                if (!input.getAttribute("value").equals(text)) {
-                    ((JavascriptExecutor) driver).executeScript("arguments[0].value = arguments[1];", input, text);
-                }
-
-                waitForLoadingToFinish();
-                success = true;
-            } catch (StaleElementReferenceException | TimeoutException e) {
-                attempts++;
-                sleep(RETRY_DELAY_MS);
-                if (attempts == RETRY_ATTEMPTS) {
-                    throw new RuntimeException("Failed to enter text after retries: " + locator, e);
-                }
-            }
-        }
+    public void enterTextAndWait(By locator, String text) {
+        retrySendKeys(locator, text);
+        waitForPageToLoad();
     }
 
-    /**
-     * Scrolls element into view.
-     */
-    public void scrollIntoView(WebElement element) {
-        ((JavascriptExecutor) driver).executeScript("arguments[0].scrollIntoView({block:'center'});", element);
+    public void waitForElementVisible(By locator) {
+        wait.until(ExpectedConditions.visibilityOfElementLocated(locator));
     }
 
-    /**
-     * Waits for page load and Fusion loading overlays to disappear.
-     */
-    public void waitForLoadingToFinish() {
-        try {
-            wait.until(new ExpectedCondition<Boolean>() {
-                public Boolean apply(WebDriver driver) {
-                    return ((JavascriptExecutor) driver).executeScript("return document.readyState").equals("complete");
-                }
-            });
-
-            if (isJQueryDefined()) {
-                wait.until(new ExpectedCondition<Boolean>() {
-                    public Boolean apply(WebDriver driver) {
-                        return ((JavascriptExecutor) driver).executeScript("return jQuery.active == 0").equals(true);
-                    }
-                });
-            }
-
-            wait.until(ExpectedConditions.invisibilityOfElementLocated(By.cssSelector(".AFBusyWait, .fusionBusy, .loading-mask")));
-
-        } catch (TimeoutException e) {
-            System.err.println("Page or overlay load timeout: " + e.getMessage());
-        }
+    public void waitForElementInvisible(By locator) {
+        wait.until(ExpectedConditions.invisibilityOfElementLocated(locator));
     }
 
-    /**
-     * Waits for a component to reload after staleness.
-     */
     public void waitForElementStalenessAndReappear(By locator) {
         WebElement oldElement = wait.until(ExpectedConditions.presenceOfElementLocated(locator));
         wait.until(ExpectedConditions.stalenessOf(oldElement));
         wait.until(ExpectedConditions.presenceOfElementLocated(locator));
     }
 
-    /**
-     * Checks if jQuery is defined.
-     */
-    public boolean isJQueryDefined() {
+    public void waitForPageToLoad() {
+        try {
+            // Wait for document ready
+            boolean docReady = false;
+            for (int i = 0; i < 10; i++) {
+                String state = (String) ((JavascriptExecutor) driver).executeScript("return document.readyState");
+                if ("complete".equals(state)) {
+                    docReady = true;
+                    break;
+                }
+                Thread.sleep(500);
+            }
+
+            if (!docReady) {
+                System.err.println("Document not ready after wait period.");
+            }
+
+            // Wait for jQuery AJAX calls to finish
+            if (isJQueryDefined()) {
+                for (int i = 0; i < 10; i++) {
+                    Long activeRequests = (Long) ((JavascriptExecutor) driver).executeScript("return jQuery.active");
+                    if (activeRequests == 0) {
+                        break;
+                    }
+                    Thread.sleep(500);
+                }
+            }
+
+            // Wait for Oracle Fusion ADF busy indicator to disappear
+            waitForElementInvisible(By.cssSelector("div.AFBusyWait"));
+
+        } catch (Exception e) {
+            System.err.println("Error while waiting for page to load: " + e.getMessage());
+        }
+    }
+
+    // -------------------------------
+    // Retry Utilities
+    // -------------------------------
+
+    private void retryClick(By locator) {
+        int attempts = 0;
+        while (attempts < maxRetries) {
+            try {
+                WebElement element = wait.until(ExpectedConditions.elementToBeClickable(locator));
+                element.click();
+                return;
+            } catch (StaleElementReferenceException | ElementClickInterceptedException | ElementNotInteractableException | TimeoutException e) {
+                attempts++;
+                pause(1000);
+                if (attempts == maxRetries) {
+                    throw new RuntimeException("Click failed after retries: " + locator, e);
+                }
+            }
+        }
+    }
+
+    private void retrySendKeys(By locator, String value) {
+        int attempts = 0;
+        while (attempts < maxRetries) {
+            try {
+                WebElement element = wait.until(ExpectedConditions.visibilityOfElementLocated(locator));
+                element.clear();
+                element.sendKeys(value);
+                return;
+            } catch (StaleElementReferenceException | ElementNotInteractableException | TimeoutException e) {
+                attempts++;
+                pause(1000);
+                if (attempts == maxRetries) {
+                    throw new RuntimeException("SendKeys failed after retries: " + locator, e);
+                }
+            }
+        }
+    }
+
+    // -------------------------------
+    // Helper Methods
+    // -------------------------------
+
+    private boolean isJQueryDefined() {
         try {
             Object result = ((JavascriptExecutor) driver).executeScript("return typeof jQuery != 'undefined'");
-            return result != null && result.equals(true);
+            return Boolean.TRUE.equals(result);
         } catch (Exception e) {
             return false;
         }
     }
 
-    /**
-     * Utility sleep for retries.
-     */
-    private void sleep(int ms) {
+    private void pause(int ms) {
         try {
             Thread.sleep(ms);
-        } catch (InterruptedException ignored) {}
-    }
-
-    // Sample usage
-    public static void main(String[] args) {
-        System.setProperty("webdriver.chrome.driver", "/path/to/chromedriver");
-        WebDriver driver = new ChromeDriver();
-        driver.manage().window().maximize();
-
-        OracleFSCMHelper fscm = new OracleFSCMHelper(driver);
-
-        try {
-            driver.get("https://your-oracle-fscm-instance.com");
-
-            fscm.enterTextAndHandleRefresh(By.id("username"), "your_username");
-            fscm.enterTextAndHandleRefresh(By.id("password"), "your_password");
-            fscm.clickElementAndHandleLoading(By.id("LoginButton"));
-
-            fscm.clickElementAndHandleLoading(By.xpath("//a[text()='Invoices']"));
-            fscm.enterTextAndHandleRefresh(By.id("invoiceNumberField"), "INV-12345");
-            fscm.clickElementAndHandleLoading(By.id("searchButton"));
-            fscm.wait.until(ExpectedConditions.visibilityOfElementLocated(By.id("searchResultsTable")));
-
-        } catch (Exception e) {
-            e.printStackTrace();
-        } finally {
-            driver.quit();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 }
+
+
+WebDriver driver = new RemoteWebDriver(new URL("http://localhost:4444/wd/hub"), new ChromeOptions().addArguments("--headless"));
+OracleFSCMHelper helper = new OracleFSCMHelper(driver);
+
+helper.enterTextAndWait(By.id("username"), "yourUser");
+helper.enterTextAndWait(By.id("password"), "yourPass");
+helper.clickElementAndWait(By.id("LoginButton"));
+
+helper.clickElementAndWait(By.xpath("//a[text()='Invoices']"));
+helper.enterTextAndWait(By.id("invoiceNumberField"), "INV-999");
+helper.clickElementAndWait(By.id("searchButton"));
+
+helper.waitForElementVisible(By.id("searchResultsTable"));
+
